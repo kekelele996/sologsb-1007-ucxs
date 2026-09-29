@@ -66,11 +66,3 @@ export interface ProjectData {
   tracks: TranscriptTrack[];
   updatedAt: string;
 }
-
-export interface PersistedEnvelope {
-  schema: 1;
-  revision: number;
-  tabId: string;
-  savedAt: number;
-  project: ProjectData;
-}

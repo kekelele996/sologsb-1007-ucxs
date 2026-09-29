@@ -1,0 +1,7 @@
+node_modules
+dist
+server
+tmp
+.output
+.astro
+*.log

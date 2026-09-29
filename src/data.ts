@@ -1,7 +1,13 @@
 import type { Confidence, ProjectData, Segment, Tag } from "./types";
 
+// A per-module-load random session suffix makes ids unique even when two
+// tabs are opened in the same millisecond (Date.now() + Math.random() alone
+// can collide across page instances that boot simultaneously).
+const SESSION_SUFFIX = Math.random().toString(36).slice(2, 10);
+let uidCounter = 0;
+
 export const uid = (prefix = "id") =>
-  `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  `${prefix}-${Date.now().toString(36)}-${SESSION_SUFFIX}-${(uidCounter++).toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 
 export const makeTag = (label: string, type: Tag["type"], color: string): Tag => ({
   id: uid("tag"),

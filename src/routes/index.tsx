@@ -5,19 +5,64 @@ import {
   For,
   Show,
   batch,
-  createEffect,
   createMemo,
   createSignal,
   onCleanup,
   onMount,
-  untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import { uid } from "../data";
+import {
+  SESSION_KEY,
+  downloadText,
+  forceSaveLocal,
+  formatTime,
+  isChild,
+  isSibling,
+  openProjectState,
+  parseTime,
+  persistDraft,
+  promoteOutboxForced,
+  readEnvelope,
+  readOutbox,
+  resolveWithIncoming,
+  saveProject,
+  writeIncoming,
+  type IncomingCandidate,
+  type PersistedEnvelope,
+} from "../persistence";
+import type { Confidence, ProjectData, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
-const TAB_ID = uid("tab");
+// A stable per-tab identity: sessionStorage is partitioned per tab, survives
+// reloads (so parked fork drafts/outboxes can be reattached) and clears when
+// the tab closes. A fresh random id per load would orphan those keys.
+function resolveTabId() {
+  try {
+    const existing = sessionStorage.getItem(SESSION_KEY);
+    if (existing) return existing;
+    const created = uid("tab");
+    sessionStorage.setItem(SESSION_KEY, created);
+    return created;
+  } catch {
+    return uid("tab");
+  }
+}
+const TAB_ID = resolveTabId();
+
+/**
+ * syncing  - local view is allowed to CAS into the shared envelope;
+ * forked   - the shared head moved first; local edits are parked as drafts,
+ *            proofreader must choose which version survives;
+ * awaiting - our save is the head and another tab saved a sibling first;
+ *            the other side is waiting for this tab's decision, so our
+ *            edits stay local and must not overwrite anything.
+ */
+type SyncPhase = "syncing" | "forked" | "awaiting";
+
+interface ConflictState {
+  /** Competing envelope to choose against. */
+  competitor: PersistedEnvelope;
+}
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -101,15 +146,31 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
 }
 
 export default function OralHistoryEditor() {
-  const loaded = loadProject();
-  const [project, setProject] = createSignal<ProjectData>(loaded.project);
-  const [revision, setRevision] = createSignal(loaded.revision);
+  const opened = openProjectState(TAB_ID);
+  const startsConflicted = opened.mode === "fork" || opened.mode === "outbox-losing" || opened.mode === "outbox-winning";
+  const [project, setProject] = createSignal<ProjectData>(opened.project);
+  const [revision, setRevision] = createSignal(opened.revision);
+  // saveId of the shared envelope this tab's view is based on.
+  const [baseSaveId, setBaseSaveId] = createSignal(opened.saveId);
+  // saveId of the last save this tab produced/adopted.
+  const [parentSaveId, setParentSaveId] = createSignal(opened.parentSaveId);
+  const [phase, setPhase] = createSignal<SyncPhase>(startsConflicted ? "forked" : "syncing");
   const [past, setPast] = createSignal<ProjectData[]>([]);
   const [future, setFuture] = createSignal<ProjectData[]>([]);
-  const [selectedId, setSelectedId] = createSignal(loaded.project.tracks[0]?.segments[0]?.id ?? "");
-  const [saveStatus, setSaveStatus] = createSignal<"saved" | "saving" | "offline">("saved");
-  const [lastAction, setLastAction] = createSignal("示例项目已就绪");
-  const [conflict, setConflict] = createSignal<PersistedEnvelope | null>(null);
+  const [selectedId, setSelectedId] = createSignal(opened.project.tracks[0]?.segments[0]?.id ?? "");
+  const [saveStatus, setSaveStatus] = createSignal<"saved" | "saving" | "offline">(startsConflicted ? "offline" : "saved");
+  const startupNotice =
+    opened.mode === "fork"
+      ? "已恢复上次未同步的分叉草稿，请确认保留哪份"
+      : opened.mode === "outbox-losing"
+        ? "本页的保存与另一标签页发生分叉，请选择保留哪份"
+        : opened.mode === "outbox-winning"
+          ? "另一个标签页基于本页版本分叉，等待您选择保留哪份"
+          : "示例项目已就绪";
+  const [lastAction, setLastAction] = createSignal(startupNotice);
+  const [conflict, setConflict] = createSignal<ConflictState | null>(
+    opened.competitor ? { competitor: opened.competitor } : opened.candidate ? { competitor: opened.candidate.envelope } : null,
+  );
   const [online, setOnline] = createSignal(true);
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [commentDraft, setCommentDraft] = createSignal("");
@@ -117,9 +178,8 @@ export default function OralHistoryEditor() {
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
-  let saveTimer: number | undefined;
-  let hydrated = false;
-  let dirty = false;
+  // Set only by edits made in THIS tab; adoption of another tab's save clears it.
+  let localDirty = startsConflicted;
 
   const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(CHANNEL_NAME) : null;
   const activeTrack = createMemo(() => {
@@ -142,6 +202,41 @@ export default function OralHistoryEditor() {
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
 
+  /**
+   * Write-through persistence. Every edit lands in localStorage synchronously,
+   * so refreshes, tab closes and sudden network loss cannot drop the last
+   * keystrokes. A lost CAS (or an unresolved cross-tab fork) parks the local
+   * version in its own draft key instead of overwriting the other save.
+   */
+  const syncSave = (): void => {
+    setSaveStatus("saving");
+    // While waiting for the other tab's proofreader to decide, the shared
+    // copy is frozen for us: refresh only the parked fork draft.
+    if (phase() === "awaiting") {
+      persistDraft(project(), revision(), TAB_ID, baseSaveId(), parentSaveId());
+      localDirty = true;
+      setSaveStatus("offline");
+      return;
+    }
+    const outcome = saveProject(project(), revision(), TAB_ID, baseSaveId(), parentSaveId());
+    if (outcome.status === "saved") {
+      setBaseSaveId(outcome.envelope.saveId);
+      setParentSaveId(outcome.envelope.saveId);
+      localDirty = false;
+      setPhase("syncing");
+      setConflict(null);
+      setSaveStatus(online() ? "saved" : "offline");
+      channel?.postMessage({ type: "sologsb-save", envelope: outcome.envelope });
+      return;
+    }
+    // Shared head moved first: keep it intact, keep editing locally, and ask.
+    setBaseSaveId(outcome.head.saveId);
+    localDirty = true;
+    setPhase("forked");
+    setSaveStatus("offline");
+    setConflict({ competitor: outcome.head });
+  };
+
   const commit = (label: string, mutate: (draft: ProjectData) => void) => {
     const current = structuredClone(project());
     const next = structuredClone(current);
@@ -154,7 +249,8 @@ export default function OralHistoryEditor() {
       setRevision((value) => value + 1);
       setLastAction(label);
     });
-    dirty = true;
+    localDirty = true;
+    syncSave();
   };
 
   const commitSegment = (label: string, mutate: (segment: Segment, draft: ProjectData) => void) => {
@@ -166,6 +262,163 @@ export default function OralHistoryEditor() {
     });
   };
 
+  // Coalesce rapid keystrokes in one text field into a single undo entry,
+  // while still persisting every keystroke immediately.
+  let typingKey = "";
+  let typingSnapshot: ProjectData | null = null;
+  let typingResetTimer: number | undefined;
+  const commitText = (key: string, label: string, mutate: (draft: ProjectData) => void) => {
+    const current = structuredClone(project());
+    const next = structuredClone(current);
+    mutate(next);
+    next.updatedAt = new Date().toISOString();
+    if (typingKey === key && typingSnapshot) {
+      batch(() => {
+        setFuture([]);
+        setProject(next);
+        setRevision((value) => value + 1);
+        setLastAction(label);
+      });
+    } else {
+      typingKey = key;
+      typingSnapshot = current;
+      batch(() => {
+        setPast((items) => [...items.slice(-49), current]);
+        setFuture([]);
+        setProject(next);
+        setRevision((value) => value + 1);
+        setLastAction(label);
+      });
+    }
+    window.clearTimeout(typingResetTimer);
+    typingResetTimer = window.setTimeout(() => {
+      typingKey = "";
+      typingSnapshot = null;
+    }, 1000);
+    localDirty = true;
+    syncSave();
+  };
+
+  /** Fast-forward to an envelope that extends the state this tab knows. */
+  const adoptIncoming = (incoming: PersistedEnvelope, notice: string) => {
+    const current = structuredClone(project());
+    batch(() => {
+      setPast((items) => [...items.slice(-49), current]);
+      setFuture([]);
+      setProject(structuredClone(incoming.project));
+      setRevision(incoming.revision);
+      setLastAction(notice);
+    });
+    setBaseSaveId(incoming.saveId);
+    setParentSaveId(incoming.saveId);
+    localDirty = false;
+    setPhase("syncing");
+    setConflict(null);
+    setSaveStatus(online() ? "saved" : "offline");
+    const stillExists = incoming.project.tracks
+      .flatMap((track) => track.segments)
+      .some((segment) => segment.id === selectedId());
+    if (!stillExists) {
+      setSelectedId(incoming.project.tracks.find((track) => track.id === incoming.project.activeTrackId)?.segments[0]?.id ?? "");
+    }
+  };
+
+  const enterForked = (competitor: PersistedEnvelope) => {
+    persistDraft(project(), revision(), TAB_ID, competitor.saveId, parentSaveId());
+    setBaseSaveId(competitor.saveId);
+    localDirty = true;
+    setPhase("forked");
+    setSaveStatus("offline");
+    setConflict({ competitor });
+  };
+
+  /**
+   * Handle a save observed from another tab, classified by lineage so the
+   * physically later writer is the one asked first and the shared draft is
+   * never silently clobbered.
+   */
+  const handleIncoming = (raw: PersistedEnvelope | undefined | null) => {
+    if (!raw || raw.tabId === TAB_ID) return;
+    const incoming = raw;
+    const head = readEnvelope();
+    if (!head) return;
+    if (incoming.saveId === baseSaveId()) { return; }
+
+    if (conflict()) {
+      // Keep the banner pointed at the newest competing envelope.
+      setConflict({ competitor: incoming });
+      return;
+    }
+
+    // Linear continuation of the head we know: silently fast-forward.
+    if (isChild(incoming, baseSaveId()) && incoming.saveId === head.saveId) {
+      if (!localDirty) { adoptIncoming(incoming, "其他标签页的修改已同步到本页");
+        return;
+      }
+      // We had edits based on the previous head: normal fork, we decide. enterForked(incoming);
+      return;
+    }
+
+    // A "keep mine" from another tab deliberately replaced a save this tab
+    // knew about: the displaced proofreader is told as well.
+    if (incoming.forced && incoming.replacedSaveId && (incoming.replacedSaveId === baseSaveId() || incoming.replacedSaveId === parentSaveId())) {
+      if (!localDirty && phase() === "syncing") { adoptIncoming(incoming, "另一标签页已保留其版本，本页内容被替换");
+        return;
+      }
+      enterForked(incoming);
+      return;
+    }
+
+    // The other save diverged from the same shared ancestor — the classic
+    // cross-process race where both physical writes "succeeded".
+    if (isSibling(head, incoming)) {
+      if (head.tabId === TAB_ID) {
+        // Our save is physically on top: we are the later writer, so this
+        // tab decides first. Park the sibling save for the proofreader.
+        const candidate: IncomingCandidate = {
+          kind: "incoming-candidate",
+          fromTabId: incoming.tabId,
+          baseSaveId: head.parentSaveId,
+          envelope: incoming,
+        };
+        writeIncoming(candidate, TAB_ID);
+        localDirty = true;
+        setPhase("awaiting");
+        setSaveStatus("offline");
+        setConflict({ competitor: incoming });
+      } else {
+        // Our save was physically displaced first: stay silent and wait for
+        // the other tab's decision. Keep our content parked so it survives
+        // reloads; if they adopt ours it returns cleanly, if they force
+        // theirs the forced-notice above asks us afterwards.
+        persistDraft(project(), revision(), TAB_ID, incoming.saveId, parentSaveId());
+        setBaseSaveId(head.saveId);
+        localDirty = true;
+        setPhase("forked");
+        setSaveStatus("offline");
+      }
+      return;
+    }
+
+    // The notification IS the current head from another tab. If our own
+    // last save is its sibling, ours lost the physical race: wait silently.
+    if (incoming.saveId === head.saveId && head.tabId !== TAB_ID) {
+      const own = readOutbox(TAB_ID);
+      const lostRace =
+        (own && isSibling(own, head)) ||
+        (!own && !!parentSaveId() && parentSaveId() !== head.saveId && head.parentSaveId !== parentSaveId() && !isChild(head, parentSaveId()));
+      if (lostRace) {
+        persistDraft(project(), revision(), TAB_ID, head.saveId, parentSaveId());
+        setBaseSaveId(head.saveId);
+        localDirty = true;
+        setPhase("forked");
+        setSaveStatus("offline");
+        return;
+      }
+      // Otherwise it is an unrelated foreign head we cannot reconcile: ask. enterForked(incoming);
+    }
+  };
+
   const undo = () => {
     const stack = past();
     if (!stack.length) return;
@@ -175,7 +428,8 @@ export default function OralHistoryEditor() {
     setProject(previous);
     setRevision((value) => value + 1);
     setLastAction("已撤销上一步");
-    dirty = true;
+    localDirty = true;
+    syncSave();
   };
 
   const redo = () => {
@@ -187,17 +441,16 @@ export default function OralHistoryEditor() {
     setProject(next);
     setRevision((value) => value + 1);
     setLastAction("已重做");
-    dirty = true;
+    localDirty = true;
+    syncSave();
   };
 
   const switchTrack = (trackId: string) => {
     commit("切换文本轨", (draft) => {
       draft.activeTrackId = trackId;
-      selectedIdSet(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
+      setSelectedId(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
     });
   };
-
-  const selectedIdSet = (id: string) => setSelectedId(id);
 
   const moveSelection = (direction: 1 | -1) => {
     const segments = activeTrack()?.segments ?? [];
@@ -343,36 +596,65 @@ export default function OralHistoryEditor() {
     });
   };
 
-  const resolveConflict = (useIncoming: boolean) => {
-    const incoming = conflict();
-    if (!incoming) return;
-    if (useIncoming) {
-      setPast((items) => [...items.slice(-49), structuredClone(project())]);
-      setProject(structuredClone(incoming.project));
-      setRevision(incoming.revision + 1);
-      setSelectedId(incoming.project.tracks.find((track) => track.id === incoming.project.activeTrackId)?.segments[0]?.id ?? "");
-      setLastAction("已采用其他标签页的版本");
-      dirty = true;
-    } else {
+  /** Use the competing version and continue on top of it. */
+  const chooseIncoming = (competitor: PersistedEnvelope) => {
+    resolveWithIncoming(competitor, TAB_ID);
+    adoptIncoming(competitor, "已采用另一标签页的版本");
+    channel?.postMessage({ type: "sologsb-save", envelope: competitor });
+  };
+
+  /** Keep this tab's content and promote it to the shared head. */
+  const chooseLocal = (competitor: PersistedEnvelope) => {
+    // Race this tab "won" (its save is still the head): mark the same
+    // envelope as a deliberate overwrite so the other tab is informed.
+    const head = readEnvelope();
+    const own = readOutbox(TAB_ID);
+    let envelope: PersistedEnvelope;
+    if (phase() === "awaiting" && head && own && head.saveId === own.saveId && head.saveId === parentSaveId()) {
+      envelope = promoteOutboxForced(own, competitor.saveId);
       setRevision((value) => value + 1);
-      setLastAction("已保留本页并覆盖冲突版本");
-      dirty = true;
+    } else {
+      envelope = forceSaveLocal(project(), revision(), TAB_ID, competitor.saveId, parentSaveId());
+      setBaseSaveId(envelope.saveId);
+      setParentSaveId(envelope.saveId);
+      setRevision((value) => value + 1);
     }
+    localDirty = false;
+    setPhase("syncing");
     setConflict(null);
+    setSaveStatus(online() ? "saved" : "offline");
+    setLastAction("已保留本页版本并覆盖另一份草稿");
+    channel?.postMessage({ type: "sologsb-save", envelope });
+  };
+
+  /** Last-chance persistence when the page is hidden or unloaded. */
+  const flushBeforeHide = () => {
+    if (phase() === "forked" || phase() === "awaiting") {
+      persistDraft(project(), revision(), TAB_ID, conflict()?.competitor.saveId ?? baseSaveId(), parentSaveId());
+      return;
+    }
+    if (!localDirty) return;
+    const outcome = saveProject(project(), revision(), TAB_ID, baseSaveId(), parentSaveId());
+    if (outcome.status === "diverged") {
+      persistDraft(project(), revision(), TAB_ID, outcome.head.saveId, parentSaveId());
+    }
   };
 
   onMount(() => {
-    hydrated = true;
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
       if (event.key !== "sologsb-1007-project-v1" || !event.newValue) return;
       try {
-        const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
-        if (incoming.tabId !== TAB_ID && incoming.revision > revision()) setConflict(incoming);
+        handleIncoming(JSON.parse(event.newValue) as PersistedEnvelope);
       } catch {
         // Ignore unrelated or malformed storage events.
       }
+    };
+    const handleChannelMessage = (event: MessageEvent) => {
+      const data = event.data as { type?: string; envelope?: PersistedEnvelope } | PersistedEnvelope;
+      const envelope = data && typeof data === "object" && "type" in data ? data.envelope : (data as PersistedEnvelope);
+      handleIncoming(envelope);
     };
     const handleKeydown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -385,10 +667,13 @@ export default function OralHistoryEditor() {
       }
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        const envelope = saveProject(project(), revision(), TAB_ID);
-        setSaveStatus("saved");
+        if (conflict()) {
+          setLastAction("存在未解决的多标签页冲突，请先选择保留哪份内容");
+          return;
+        }
+        if (localDirty) syncSave();
+        setSaveStatus(online() ? "saved" : "offline");
         setLastAction("已保存本地草稿");
-        channel?.postMessage(envelope);
         return;
       }
       if (editing) return;
@@ -412,38 +697,24 @@ export default function OralHistoryEditor() {
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
     window.addEventListener("storage", handleStorage);
+    window.addEventListener("pagehide", flushBeforeHide);
+    document.addEventListener("visibilitychange", flushBeforeHide);
     window.addEventListener("keydown", handleKeydown);
+    channel?.addEventListener("message", handleChannelMessage);
     setOnline(navigator.onLine);
     onCleanup(() => {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       window.removeEventListener("storage", handleStorage);
+      window.removeEventListener("pagehide", flushBeforeHide);
+      document.removeEventListener("visibilitychange", flushBeforeHide);
       window.removeEventListener("keydown", handleKeydown);
+      channel?.removeEventListener("message", handleChannelMessage);
     });
   });
 
-  channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope>) => {
-    if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
-  });
-
-  createEffect(() => {
-    const current = project();
-    const currentRevision = revision();
-    if (!hydrated) return;
-    setSaveStatus(online() ? "saving" : "offline");
-    window.clearTimeout(saveTimer);
-    saveTimer = window.setTimeout(() => {
-      const envelope = saveProject(current, currentRevision, TAB_ID);
-      setSaveStatus(online() ? "saved" : "offline");
-      if (dirty) {
-        channel?.postMessage(envelope);
-        dirty = false;
-      }
-    }, 420);
-  });
-
   onCleanup(() => {
-    window.clearTimeout(saveTimer);
+    window.clearTimeout(typingResetTimer);
     channel?.close();
   });
 
@@ -455,17 +726,22 @@ export default function OralHistoryEditor() {
   return (
     <div class="app-shell">
       <Show when={conflict()}>
-        {(incoming) => (
+        {(state) => (
           <div class="conflict-banner" role="alert">
             <div>
-              <strong>检测到另一个标签页修改了同一草稿</strong>
+              <strong>
+                {phase() === "awaiting"
+                  ? "另一标签页已从本页版本分叉，等待您决定保留哪份内容"
+                  : "两个标签页已从同一版本分叉，请选择保留哪份内容"}
+              </strong>
               <span>
-                对方版本保存于 {new Date(incoming().savedAt).toLocaleTimeString()}。为避免静默覆盖，请选择要保留的版本。
+                另一版本保存于 {new Date(state().competitor.savedAt).toLocaleTimeString()}（版本 {state().competitor.revision + 1}）；
+                本页的批注与修改已另存为独立草稿，刷新也不会丢失。系统不会自动合并，以免盖掉人工校对结果。
               </span>
             </div>
             <div class="conflict-actions">
-              <button class="btn btn-quiet" onClick={() => resolveConflict(false)}>保留本页</button>
-              <button class="btn btn-danger" onClick={() => resolveConflict(true)}>载入对方版本</button>
+              <button class="btn btn-quiet" onClick={() => chooseLocal(state().competitor)}>保留本页</button>
+              <button class="btn btn-danger" onClick={() => chooseIncoming(state().competitor)}>载入对方版本</button>
             </div>
           </div>
         )}
@@ -477,7 +753,15 @@ export default function OralHistoryEditor() {
           <input
             aria-label="项目标题"
             value={project().title}
-            onChange={(event) => commit("修改项目标题", (draft) => { draft.title = event.currentTarget.value; })}
+            onInput={(event) => {
+              if (event.isComposing) return;
+              const value = event.currentTarget.value;
+              commitText("project-title", "修改项目标题", (draft) => { draft.title = value; });
+            }}
+            onCompositionEnd={(event) => {
+              const value = event.currentTarget.value;
+              commitText("project-title", "修改项目标题", (draft) => { draft.title = value; });
+            }}
           />
           <div class="project-meta">
             <span>{project().interviewee}</span>
@@ -503,7 +787,7 @@ export default function OralHistoryEditor() {
               <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <p>每次修改即时写入本机；断网或刷新后仍可继续校对。</p>
           </section>
 
           <section class="panel-section">
@@ -637,7 +921,33 @@ export default function OralHistoryEditor() {
                     ref={editorRef}
                     rows="7"
                     value={segment().text}
-                    onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
+                    onInput={(event) => {
+                      if (event.isComposing) return;
+                      const value = event.currentTarget.value;
+                      const cursor = event.currentTarget.selectionStart;
+                      commitText(`segment-text-${selectedId()}`, "校正转写文本", (draft) => {
+                        const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+                        const target = track?.segments.find((item) => item.id === selectedId());
+                        if (target) {
+                          target.text = value;
+                          target.reviewed = false;
+                        }
+                      });
+                      queueMicrotask(() => {
+                        if (document.activeElement === editorRef && editorRef) editorRef.selectionStart = editorRef.selectionEnd = cursor;
+                      });
+                    }}
+                    onCompositionEnd={(event) => {
+                      const value = event.currentTarget.value;
+                      commitText(`segment-text-${selectedId()}`, "校正转写文本", (draft) => {
+                        const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+                        const target = track?.segments.find((item) => item.id === selectedId());
+                        if (target) {
+                          target.text = value;
+                          target.reviewed = false;
+                        }
+                      });
+                    }}
                   />
                   <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
 
