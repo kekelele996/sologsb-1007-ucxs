@@ -17,7 +17,8 @@ const html = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#17212b" />
   <meta name="description" content="口述历史转写与标注编辑器" />
-  <link rel="icon" href="data:," />
+  <link rel="icon" href="/icon.svg" />
+  <link rel="manifest" href="/manifest.webmanifest" />
   <title>口述历史转写与标注编辑器</title>
   ${assets}
   <link rel="modulepreload" href="/${entry.file}" />

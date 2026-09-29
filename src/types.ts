@@ -67,10 +67,36 @@ export interface ProjectData {
   updatedAt: string;
 }
 
+/**
+ * - revision: monotonically increasing logical clock, one tick per save.
+ * - kind "fork" means the writer kept its own content after seeing a
+ *   divergent tip; supersedesRevision records the tip it deliberately replaced.
+ */
 export interface PersistedEnvelope {
   schema: 1;
+  id: string;
+  /** Envelope id this save was built on top of. */
+  parentId?: string;
   revision: number;
   tabId: string;
   savedAt: number;
+  kind: "normal" | "fork";
+  supersedesRevision?: number;
   project: ProjectData;
+}
+
+/** Local edits that never made it to the main draft because a fork was detected. */
+export interface PendingDraft {
+  id: string;
+  tabId: string;
+  baseRevision: number;
+  savedAt: number;
+  project: ProjectData;
+}
+
+/** Free-text the proofreader typed but had not submitted before a reload. */
+export interface ComposerDrafts {
+  text: Record<string, string>;
+  comment: Record<string, string>;
+  reply: Record<string, string>;
 }

@@ -1,0 +1,19 @@
+{
+  "name": "口述历史转写与标注编辑器",
+  "short_name": "口述校对",
+  "description": "面向口述史项目的本地优先转写校对与标注工作台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "lang": "zh-CN",
+  "background_color": "#e8e8e2",
+  "theme_color": "#17212b",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

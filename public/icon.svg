@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
+  <rect width="192" height="192" rx="36" fill="#17212b"/>
+  <rect x="30" y="30" width="132" height="132" rx="18" fill="#2b3a46" stroke="rgba(255,255,255,.25)"/>
+  <text x="96" y="86" text-anchor="middle" font-family="sans-serif" font-size="46" fill="#e4aa68" letter-spacing="6">口述</text>
+  <text x="96" y="134" text-anchor="middle" font-family="sans-serif" font-size="34" font-weight="700" fill="#ffffff">1007</text>
+</svg>

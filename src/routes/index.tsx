@@ -10,14 +10,32 @@ import {
   createSignal,
   onCleanup,
   onMount,
-  untrack,
 } from "solid-js";
-import { createSeedProject, uid } from "../data";
-import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
+import { uid } from "../data";
+import {
+  STORAGE_KEY,
+  clearPendingDraft,
+  downloadText,
+  formatTime,
+  loadComposerDrafts,
+  loadPendingDraft,
+  loadProject,
+  parseTime,
+  readEnvelope,
+  saveComposerDrafts,
+  savePendingDraft,
+  saveProject,
+} from "../persistence";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
+
+/** Undo checkpoints remember a coalesce key so rapid typing is one undo step. */
+interface Checkpoint {
+  data: ProjectData;
+  key?: string;
+}
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -102,9 +120,12 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
 
 export default function OralHistoryEditor() {
   const loaded = loadProject();
+  const storedEnvelope = readEnvelope();
+  const storedDrafts = loadComposerDrafts();
+
   const [project, setProject] = createSignal<ProjectData>(loaded.project);
   const [revision, setRevision] = createSignal(loaded.revision);
-  const [past, setPast] = createSignal<ProjectData[]>([]);
+  const [past, setPast] = createSignal<Checkpoint[]>([]);
   const [future, setFuture] = createSignal<ProjectData[]>([]);
   const [selectedId, setSelectedId] = createSignal(loaded.project.tracks[0]?.segments[0]?.id ?? "");
   const [saveStatus, setSaveStatus] = createSignal<"saved" | "saving" | "offline">("saved");
@@ -112,14 +133,21 @@ export default function OralHistoryEditor() {
   const [conflict, setConflict] = createSignal<PersistedEnvelope | null>(null);
   const [online, setOnline] = createSignal(true);
   const [helpOpen, setHelpOpen] = createSignal(false);
-  const [commentDraft, setCommentDraft] = createSignal("");
-  const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
+  // Free-text composer drafts, keyed by segment / comment id, survive reloads.
+  const [textDrafts, setTextDrafts] = createSignal<Record<string, string>>(storedDrafts.text);
+  const [commentDrafts, setCommentDrafts] = createSignal<Record<string, string>>(storedDrafts.comment);
+  const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>(storedDrafts.reply);
+  const [restoredNote, setRestoredNote] = createSignal(false);
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
   let hydrated = false;
   let dirty = false;
+  // Revision of the storage tip this tab has last seen; diverging tips are forks.
+  let baseRevision = loaded.revision;
+  // Identity of the storage tip this tab's working copy was built from.
+  let baseTipId: string | undefined = storedEnvelope?.id;
 
   const channel = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(CHANNEL_NAME) : null;
   const activeTrack = createMemo(() => {
@@ -142,13 +170,47 @@ export default function OralHistoryEditor() {
     project().speakers.find((speaker) => speaker.id === speakerId) ?? project().speakers[0];
   const tagById = (tagId: string) => project().tags.find((tag) => tag.id === tagId);
 
-  const commit = (label: string, mutate: (draft: ProjectData) => void) => {
+  const persistDrafts = () => {
+    saveComposerDrafts({ text: textDrafts(), comment: commentDrafts(), reply: replyDrafts() });
+  };
+
+  /** Drop transcript drafts that are already part of the saved project. */
+  const pruneTextDrafts = (data: ProjectData) => {
+    const current = textDrafts();
+    const next: Record<string, string> = {};
+    let changed = false;
+    for (const [id, value] of Object.entries(current)) {
+      const segment = data.tracks.flatMap((track) => track.segments).find((item) => item.id === id);
+      if (segment && segment.text !== value) {
+        next[id] = value;
+      } else {
+        changed = true;
+      }
+    }
+    if (changed) {
+      setTextDrafts(next);
+      saveComposerDrafts({ text: next, comment: commentDrafts(), reply: replyDrafts() });
+    }
+  };
+
+  const commit = (label: string, mutate: (draft: ProjectData) => void, coalesceKey?: string) => {
+    const stack = past();
+    // Continued typing inside the same field collapses into one undo step.
+    if (coalesceKey && stack.length && stack[stack.length - 1].key === coalesceKey) {
+      const next = structuredClone(project());
+      mutate(next);
+      next.updatedAt = new Date().toISOString();
+      setProject(next);
+      setRevision((value) => value + 1);
+      dirty = true;
+      return;
+    }
     const current = structuredClone(project());
     const next = structuredClone(current);
     mutate(next);
     next.updatedAt = new Date().toISOString();
     batch(() => {
-      setPast((items) => [...items.slice(-49), current]);
+      setPast((items) => [...items.slice(-49), { data: current, key: coalesceKey }]);
       setFuture([]);
       setProject(next);
       setRevision((value) => value + 1);
@@ -157,13 +219,17 @@ export default function OralHistoryEditor() {
     dirty = true;
   };
 
-  const commitSegment = (label: string, mutate: (segment: Segment, draft: ProjectData) => void) => {
+  const commitSegment = (label: string, mutate: (segment: Segment, draft: ProjectData) => void, coalesceKey?: string) => {
     const id = selectedId();
-    commit(label, (draft) => {
-      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
-      const segment = track?.segments.find((item) => item.id === id);
-      if (segment) mutate(segment, draft);
-    });
+    commit(
+      label,
+      (draft) => {
+        const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+        const segment = track?.segments.find((item) => item.id === id);
+        if (segment) mutate(segment, draft);
+      },
+      coalesceKey,
+    );
   };
 
   const undo = () => {
@@ -172,7 +238,7 @@ export default function OralHistoryEditor() {
     const previous = stack[stack.length - 1];
     setFuture((items) => [structuredClone(project()), ...items].slice(0, 50));
     setPast(stack.slice(0, -1));
-    setProject(previous);
+    setProject(previous.data);
     setRevision((value) => value + 1);
     setLastAction("已撤销上一步");
     dirty = true;
@@ -182,7 +248,7 @@ export default function OralHistoryEditor() {
     const stack = future();
     if (!stack.length) return;
     const next = stack[0];
-    setPast((items) => [...items.slice(-49), structuredClone(project())]);
+    setPast((items) => [...items.slice(-49), { data: structuredClone(project()) }]);
     setFuture(stack.slice(1));
     setProject(next);
     setRevision((value) => value + 1);
@@ -193,11 +259,9 @@ export default function OralHistoryEditor() {
   const switchTrack = (trackId: string) => {
     commit("切换文本轨", (draft) => {
       draft.activeTrackId = trackId;
-      selectedIdSet(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
+      setSelectedId(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
     });
   };
-
-  const selectedIdSet = (id: string) => setSelectedId(id);
 
   const moveSelection = (direction: 1 | -1) => {
     const segments = activeTrack()?.segments ?? [];
@@ -235,8 +299,14 @@ export default function OralHistoryEditor() {
           comments: [],
         });
       }
+      setTextDrafts((drafts) => {
+        const nextDrafts = { ...drafts };
+        delete nextDrafts[current.id];
+        return nextDrafts;
+      });
       setSelectedId(secondId);
     });
+    persistDrafts();
   };
 
   const mergeWithNext = () => {
@@ -274,7 +344,8 @@ export default function OralHistoryEditor() {
   };
 
   const addComment = () => {
-    const body = commentDraft().trim();
+    const id = selectedId();
+    const body = (commentDrafts()[id] ?? "").trim();
     if (!body) return;
     commitSegment("添加批注", (segment) => {
       segment.comments.unshift({
@@ -287,7 +358,8 @@ export default function OralHistoryEditor() {
       });
       segment.reviewed = false;
     });
-    setCommentDraft("");
+    setCommentDrafts((drafts) => ({ ...drafts, [id]: "" }));
+    persistDrafts();
   };
 
   const addReply = (commentId: string) => {
@@ -303,6 +375,7 @@ export default function OralHistoryEditor() {
       });
     });
     setReplyDrafts((drafts) => ({ ...drafts, [commentId]: "" }));
+    persistDrafts();
   };
 
   const toggleComment = (commentId: string) => {
@@ -343,20 +416,119 @@ export default function OralHistoryEditor() {
     });
   };
 
+  const parkEditsAndAsk = (incoming: PersistedEnvelope) => {
+    // Our edits are not in that tip: park them locally before asking the user.
+    savePendingDraft({
+      id: uid("pending"),
+      tabId: TAB_ID,
+      baseRevision,
+      savedAt: Date.now(),
+      project: structuredClone(project()),
+    });
+    setConflict(incoming);
+  };
+
+  /**
+   * Adopt a newer tip when this tab has no competing edits.
+   * A "fork" envelope that deliberately replaces a revision we already
+   * saved is never adopted silently — the proofreader must confirm it.
+   */
+  const receiveEnvelope = (incoming: PersistedEnvelope) => {
+    if (incoming.id === baseTipId || incoming.revision < baseRevision || conflict()) return;
+    const overridesOurSavedTip =
+      incoming.kind === "fork" && (incoming.supersedesRevision ?? -1) >= baseRevision;
+    const isLinearChild = incoming.parentId === baseTipId;
+    if (!dirty && !overridesOurSavedTip && isLinearChild) {
+      adoptIncoming(incoming);
+      return;
+    }
+    parkEditsAndAsk(incoming);
+  };
+
+  const adoptIncoming = (incoming: PersistedEnvelope) => {
+    batch(() => {
+      setPast((items) => [...items.slice(-49), { data: structuredClone(project()) }]);
+      setFuture([]);
+      setProject(structuredClone(incoming.project));
+      setRevision(incoming.revision);
+      setLastAction("已同步其他标签页的版本");
+    });
+    baseRevision = incoming.revision;
+    baseTipId = incoming.id;
+    dirty = false;
+    pruneTextDrafts(incoming.project);
+    const track = incoming.project.tracks.find((item) => item.id === incoming.project.activeTrackId);
+    if (!track?.segments.some((item) => item.id === selectedId())) {
+      setSelectedId(track?.segments[0]?.id ?? "");
+    }
+  };
+
+  /**
+   * Persist the working copy. Returns false when a divergent tip was found
+   * and a conflict prompt is blocking the write.
+   */
+  const flushSave = (manual = false): boolean => {
+    if (!hydrated || conflict()) return false;
+    const stored = readEnvelope();
+    const inSyncWithTip = !!stored && stored.id === baseTipId && !dirty;
+    if (inSyncWithTip) {
+      setSaveStatus(online() ? "saved" : "offline");
+      return true;
+    }
+
+    if (stored && stored.id !== baseTipId) {
+      const overridesOurSavedTip =
+        stored.kind === "fork" && (stored.supersedesRevision ?? -1) >= baseRevision;
+      const isLinearChild = stored.parentId === baseTipId;
+      if (!dirty && !overridesOurSavedTip && isLinearChild) {
+        adoptIncoming(stored);
+        return true;
+      }
+      parkEditsAndAsk(stored);
+      return false;
+    }
+
+    // Revision is read-modify-write off the current storage tip, so two tabs
+    // that race from the same base can never tie.
+    const nextRevision = stored ? stored.revision + 1 : revision();
+    const envelope = saveProject(project(), nextRevision, TAB_ID, { parentId: baseTipId });
+    baseRevision = nextRevision;
+    baseTipId = envelope.id;
+    setRevision(nextRevision);
+    dirty = false;
+    clearPendingDraft();
+    pruneTextDrafts(project());
+    setSaveStatus(online() ? "saved" : "offline");
+    if (manual) setLastAction("已保存本地草稿");
+    channel?.postMessage(envelope);
+    return true;
+  };
+
   const resolveConflict = (useIncoming: boolean) => {
     const incoming = conflict();
     if (!incoming) return;
     if (useIncoming) {
-      setPast((items) => [...items.slice(-49), structuredClone(project())]);
-      setProject(structuredClone(incoming.project));
-      setRevision(incoming.revision + 1);
-      setSelectedId(incoming.project.tracks.find((track) => track.id === incoming.project.activeTrackId)?.segments[0]?.id ?? "");
+      adoptIncoming(incoming);
+      clearPendingDraft();
       setLastAction("已采用其他标签页的版本");
-      dirty = true;
     } else {
-      setRevision((value) => value + 1);
-      setLastAction("已保留本页并覆盖冲突版本");
-      dirty = true;
+      const tip = readEnvelope();
+      const supersedes = Math.max(incoming.revision, tip?.revision ?? 0);
+      const nextRevision = supersedes + 1;
+      const envelope = saveProject(project(), nextRevision, TAB_ID, {
+        kind: "fork",
+        supersedesRevision: supersedes,
+        // Keep the link to our actual parent so the other tab can see the fork.
+        parentId: baseTipId,
+      });
+      baseRevision = nextRevision;
+      baseTipId = envelope.id;
+      setRevision(nextRevision);
+      dirty = false;
+      clearPendingDraft();
+      setSaveStatus(online() ? "saved" : "offline");
+      setLastAction("已保留本页内容，其他标签页将收到冲突提示");
+      channel?.postMessage(envelope);
     }
     setConflict(null);
   };
@@ -366,10 +538,9 @@ export default function OralHistoryEditor() {
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
     const handleStorage = (event: StorageEvent) => {
-      if (event.key !== "sologsb-1007-project-v1" || !event.newValue) return;
+      if (event.key !== STORAGE_KEY || !event.newValue) return;
       try {
-        const incoming = JSON.parse(event.newValue) as PersistedEnvelope;
-        if (incoming.tabId !== TAB_ID && incoming.revision > revision()) setConflict(incoming);
+        receiveEnvelope(JSON.parse(event.newValue) as PersistedEnvelope);
       } catch {
         // Ignore unrelated or malformed storage events.
       }
@@ -385,10 +556,7 @@ export default function OralHistoryEditor() {
       }
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        const envelope = saveProject(project(), revision(), TAB_ID);
-        setSaveStatus("saved");
-        setLastAction("已保存本地草稿");
-        channel?.postMessage(envelope);
+        flushSave(true);
         return;
       }
       if (editing) return;
@@ -409,36 +577,66 @@ export default function OralHistoryEditor() {
         setHelpOpen(true);
       }
     };
+    // Flush before the page disappears so the last keystrokes are never lost.
+    const handleHide = () => {
+      persistDrafts();
+      flushSave();
+    };
+
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
     window.addEventListener("storage", handleStorage);
     window.addEventListener("keydown", handleKeydown);
-    setOnline(navigator.onLine);
+    window.addEventListener("pagehide", handleHide);
+    document.addEventListener("visibilitychange", handleHide);
+    setOnline(typeof navigator !== "undefined" ? navigator.onLine : true);
+
+    // Recover edits that were parked because a fork blocked their save.
+    const pending = loadPendingDraft();
+    if (pending) {
+      const tip = readEnvelope();
+      setProject(structuredClone(pending.project));
+      pruneTextDrafts(pending.project);
+      baseTipId = undefined; // Parked edits do not descend from the current tip.
+      if (tip && tip.revision > pending.baseRevision) {
+        // The diverged version is still the tip: ask before either side wins.
+        baseRevision = pending.baseRevision;
+        setRevision(pending.baseRevision + 1);
+        dirty = true;
+        setRestoredNote(true);
+        setConflict(tip);
+      } else {
+        baseRevision = tip?.revision ?? pending.baseRevision;
+        baseTipId = tip?.id;
+        setRevision(baseRevision + 1);
+        dirty = true;
+        setRestoredNote(true);
+        setLastAction("已找回上次未及保存的草稿");
+      }
+    }
+
     onCleanup(() => {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener("keydown", handleKeydown);
+      window.removeEventListener("pagehide", handleHide);
+      document.removeEventListener("visibilitychange", handleHide);
     });
   });
 
   channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope>) => {
-    if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
+    receiveEnvelope(event.data);
   });
 
   createEffect(() => {
-    const current = project();
-    const currentRevision = revision();
+    project();
+    revision();
     if (!hydrated) return;
     setSaveStatus(online() ? "saving" : "offline");
     window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => {
-      const envelope = saveProject(current, currentRevision, TAB_ID);
-      setSaveStatus(online() ? "saved" : "offline");
-      if (dirty) {
-        channel?.postMessage(envelope);
-        dirty = false;
-      }
+      flushSave();
     }, 420);
   });
 
@@ -458,13 +656,19 @@ export default function OralHistoryEditor() {
         {(incoming) => (
           <div class="conflict-banner" role="alert">
             <div>
-              <strong>检测到另一个标签页修改了同一草稿</strong>
+              <strong>
+                {incoming().kind === "fork"
+                  ? "另一个标签页在您之后选择保留它自己的版本"
+                  : "两个标签页已从同一版本分开修改"}
+              </strong>
               <span>
-                对方版本保存于 {new Date(incoming().savedAt).toLocaleTimeString()}。为避免静默覆盖，请选择要保留的版本。
+                {restoredNote() ? "已为您找回本页未保存的草稿。" : ""}
+                对方版本保存于 {new Date(incoming().savedAt).toLocaleTimeString()}
+                ，两边内容不一致。请决定保留哪一份，系统不会静默覆盖。
               </span>
             </div>
             <div class="conflict-actions">
-              <button class="btn btn-quiet" onClick={() => resolveConflict(false)}>保留本页</button>
+              <button class="btn btn-quiet" onClick={() => resolveConflict(false)}>保留本页内容</button>
               <button class="btn btn-danger" onClick={() => resolveConflict(true)}>载入对方版本</button>
             </div>
           </div>
@@ -503,7 +707,7 @@ export default function OralHistoryEditor() {
               <span>{project().tracks.flatMap((track) => track.segments).filter((segment) => segment.reviewed).length} / {project().tracks.flatMap((track) => track.segments).length} 片段</span>
             </div>
             <div class="progress-track"><i style={{ width: `${completedPercent()}%` }} /></div>
-            <p>修改会自动保存在本机；断网后仍可继续校对。</p>
+            <p>修改会自动保存在本机；断网或刷新后仍可继续校对。</p>
           </section>
 
           <section class="panel-section">
@@ -627,8 +831,8 @@ export default function OralHistoryEditor() {
                   </select>
 
                   <div class="time-grid">
-                    <label>开始<input type="text" value={formatTime(segment().start)} onChange={(event) => commitSegment("修改开始时间", (item) => { item.start = parseTime(event.currentTarget.value); })} /></label>
-                    <label>结束<input type="text" value={formatTime(segment().end)} onChange={(event) => commitSegment("修改结束时间", (item) => { item.end = parseTime(event.currentTarget.value); })} /></label>
+                    <label>开始<input type="text" value={formatTime(segment().start)} onChange={(event) => commitSegment("修改开始时间", (item) => { item.start = parseTime(event.currentTarget.value); }, `start:${segment().id}`)} /></label>
+                    <label>结束<input type="text" value={formatTime(segment().end)} onChange={(event) => commitSegment("修改结束时间", (item) => { item.end = parseTime(event.currentTarget.value); }, `end:${segment().id}`)} /></label>
                   </div>
 
                   <label class="field-label" for="transcript-editor">转写文本</label>
@@ -636,10 +840,31 @@ export default function OralHistoryEditor() {
                     id="transcript-editor"
                     ref={editorRef}
                     rows="7"
-                    value={segment().text}
-                    onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
+                    value={textDrafts()[segment().id] ?? segment().text}
+                    onInput={(event) => {
+                      const id = segment().id;
+                      const value = event.currentTarget.value;
+                      setTextDrafts((drafts) => ({ ...drafts, [id]: value }));
+                      commitSegment(
+                        "校正转写文本",
+                        (item) => { item.text = value; item.reviewed = false; },
+                        `text:${id}`,
+                      );
+                      persistDrafts();
+                    }}
+                    onBlur={() => {
+                      const id = segment().id;
+                      if (textDrafts()[id] === project().tracks.flatMap((track) => track.segments).find((item) => item.id === id)?.text) {
+                        setTextDrafts((drafts) => {
+                          const nextDrafts = { ...drafts };
+                          delete nextDrafts[id];
+                          return nextDrafts;
+                        });
+                        persistDrafts();
+                      }
+                    }}
                   />
-                  <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
+                  <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。输入中的内容也会实时存为本地草稿。</div>
 
                   <div class="field-label">置信度</div>
                   <div class="confidence-picker" role="radiogroup" aria-label="置信度">
@@ -687,9 +912,18 @@ export default function OralHistoryEditor() {
                 </Tabs.Content>
 
                 <Tabs.Content value="comments" class="tab-content comments-content">
-                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论。</p></div>
+                  <div class="content-title"><h3>批注与回复</h3><p>批注不会改写原文，可保留校对依据并继续讨论；未发送的输入在刷新后仍会保留。</p></div>
                   <div class="comment-compose">
-                    <textarea rows="3" placeholder="记录读音、词义或专名依据…" value={commentDraft()} onInput={(event) => setCommentDraft(event.currentTarget.value)} />
+                    <textarea
+                      rows="3"
+                      placeholder="记录读音、词义或专名依据…"
+                      value={commentDrafts()[segment().id] ?? ""}
+                      onInput={(event) => {
+                        const id = segment().id;
+                        setCommentDrafts((drafts) => ({ ...drafts, [id]: event.currentTarget.value }));
+                        persistDrafts();
+                      }}
+                    />
                     <button class="btn btn-primary" onClick={addComment}>添加批注</button>
                   </div>
                   <For each={segment().comments} fallback={<div class="mini-empty">当前片段还没有批注。</div>}>
@@ -704,7 +938,11 @@ export default function OralHistoryEditor() {
                           <input
                             value={replyDrafts()[comment.id] ?? ""}
                             placeholder="回复…"
-                            onInput={(event) => setReplyDrafts((drafts) => ({ ...drafts, [comment.id]: event.currentTarget.value }))}
+                            onInput={(event) => {
+                              const id = comment.id;
+                              setReplyDrafts((drafts) => ({ ...drafts, [id]: event.currentTarget.value }));
+                              persistDrafts();
+                            }}
                             onKeyDown={(event) => { if (event.key === "Enter") addReply(comment.id); }}
                           />
                           <button onClick={() => addReply(comment.id)}>回复</button>
